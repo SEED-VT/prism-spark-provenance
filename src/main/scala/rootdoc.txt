@@ -1,0 +1,80 @@
+=Prism: field-level data provenance for Apache Spark 4=
+
+Prism attaches to stock Spark 4.1 as a library and captures data lineage for Spark SQL,
+DataFrame, PySpark, and RDD jobs. After a job runs, any output record can be traced
+backward to the input records that produced it, and forward again.
+
+This is the API reference. The repository's README and docs folder cover installation,
+design, and benchmarks.
+
+==Quick start (Spark SQL)==
+{{{
+// 1. register the extension at session build
+val spark = SparkSession.builder()
+  .config("spark.sql.extensions", "org.apache.spark.sql.lineage.PrismSQLExtension")
+  .config("spark.prism.sql.capture", "true")
+  .getOrCreate()
+
+// 2. run a query and collect rows with their lineage ids
+val df = spark.sql("SELECT category, SUM(amount) FROM sales GROUP BY category")
+val rowsWithIds = PrismSQL.collectWithLineage(df)
+
+// 3. trace one output row back to the source records
+var cursor = PrismSQL.trace(df, Seq(rowsWithIds.head._2))
+while (!cursor.atScan) cursor = cursor.goBack()
+cursor.show().foreach(println)
+
+// 4. release the lineage when done
+PrismSQL.releaseLineage(df)
+}}}
+
+==Where to start==
+
+  - Spark SQL and DataFrames. [[org.apache.spark.sql.lineage.PrismSQL]] is the entry
+    point, with `collectWithLineage`, `trace` (which returns a
+    [[org.apache.spark.sql.lineage.TraceCursor]] with `goBack`, `goNext`, and `show`),
+    `traceAllSources`, `lineageSize`, and `releaseLineage`. Register
+    [[org.apache.spark.sql.lineage.PrismSQLExtension]] with
+    `--conf spark.sql.extensions=...` and switch capture with `spark.prism.sql.capture`.
+
+  - RDD API. Wrap a `SparkContext` in [[org.apache.spark.lineage.LineageContext]], call
+    `setCaptureLineage(true)`, run a job, then use `getLineage()`, `goBack()`,
+    `goNext()`, and `show()`.
+
+  - PySpark. Ship `python/prism.py` and its companion modules. `prism.Prism(spark)`
+    wraps the SQL API over py4j and adds field lineage through UDFs and influence.
+
+==How capture works==
+
+Prism records compact `(inputId, outputId)` associations at stage boundaries and joins
+them at trace time. Two mechanisms let it run as a library.
+
+  - The code lives in `org.apache.spark.*` packages, so it can use Spark's
+    `private[spark]` internals through subclassing, DAG splicing, and a few reflective
+    reads.
+  - SQL capture is injected as physical-plan tap operators by a `SparkSessionExtensions`
+    columnar rule before `CollapseCodegenStages`, so each tap's per-row capture is fused
+    into Spark's generated code. See [[org.apache.spark.sql.lineage.TapExec]] and
+    [[org.apache.spark.sql.lineage.PrismSQLExtension]].
+
+Lineage is materialized into executor `BlockManager`s as compact primitive-array blocks
+([[org.apache.spark.sql.lineage.TapBlock]]) and resolved by an executor-side filtering
+walk over those blocks.
+
+==Optimizations and tuning==
+
+Five capture and trace optimizations are on by default. Each can be switched off with
+`spark.prism.ablation`, and every unoptimized path produces identical lineage. See
+[[org.apache.spark.lineage.PrismAblation]].
+
+`spark.prism.lineage.storageLevel` (default `MEMORY_AND_DISK_SER`) sets where lineage
+blocks live, and [[org.apache.spark.sql.lineage.PrismSQL.lineageSize]] reports a
+query's footprint.
+
+==Scope and guarantees==
+
+Capture supports a defined operator set and raises
+`PrismUnsupportedOperatorException` on anything outside it rather than producing wrong
+lineage. Across shuffles, a trace is exact at the level of the group key, and
+broadcast-join probe sides are exact per record. `show()` resolves traces by re-reading
+the source files, which is valid while those files are unchanged.

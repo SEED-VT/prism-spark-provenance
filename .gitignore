@@ -1,0 +1,13 @@
+target/
+project/target/
+project/project/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+tpcds/data/
+spark-warehouse/
+metastore_db/
+derby.log
+demo/spark-*/
+jars/*.jar
+.DS_Store

@@ -1,0 +1,58 @@
+# A Spark cluster with Prism: one master, a scalable set of workers, and JupyterLab as
+# the driver. All containers share /data, so executors read the tables the notebooks write.
+#
+#   docker compose -f demo/docker-compose.yml up --build
+#   docker compose -f demo/docker-compose.yml up --scale spark-worker=4          scale out
+#   PRISM_SCALE=10 docker compose -f demo/docker-compose.yml up                  scale up
+#   docker compose -f demo/docker-compose.yml --profile validate run --rm validate
+#
+# Settings read from the host environment:
+#   PRISM_SCALE     multiplies the rows of every table the notebooks generate (default 1)
+#   WORKER_CORES    cores per worker (default 2)
+#   WORKER_MEMORY   memory per worker (default 2g)
+#   JUPYTER_PORT    host port for JupyterLab (default 8888)
+#   SPARK_UI_PORT   host port for the Spark master page (default 8080)
+
+x-prism: &prism
+  image: prism-demo:latest
+  volumes:
+    - prism-data:/data
+  environment:
+    SPARK_MASTER: spark://spark-master:7077
+    PRISM_SCALE: ${PRISM_SCALE:-1}
+    WORKER_CORES: ${WORKER_CORES:-2}
+    WORKER_MEMORY: ${WORKER_MEMORY:-2g}
+
+services:
+  spark-master:
+    <<: *prism
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
+    command: master
+    hostname: spark-master
+    ports:
+      - "${SPARK_UI_PORT:-8080}:8080"
+
+  spark-worker:
+    <<: *prism
+    command: worker
+    depends_on: [spark-master]
+    deploy:
+      replicas: 2
+
+  jupyter:
+    <<: *prism
+    command: lab
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"
+    depends_on: [spark-worker]
+
+  validate:
+    <<: *prism
+    command: validate
+    depends_on: [spark-worker]
+    profiles: [validate]
+
+volumes:
+  prism-data:

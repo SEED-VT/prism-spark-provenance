@@ -1,0 +1,7 @@
+target
+project/target
+project/project
+**/__pycache__
+**/.ipynb_checkpoints
+tpcds/data
+spark-warehouse
