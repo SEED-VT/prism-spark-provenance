@@ -3,7 +3,7 @@
 : "${SPARK_HOME:?set SPARK_HOME to a Spark 4.1.2 distribution}"
 export PYSPARK_PYTHON="${PYSPARK_PYTHON:-python3}"
 export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
-JAR="$ROOT/target/scala-2.13/prism_2.13-1.0.0.jar"
+JAR="$ROOT/target/scala-2.13/prism_2.13-0.0.1.jar"
 FASTUTIL="$ROOT/jars/fastutil-8.5.15.jar"
 [ -f "$FASTUTIL" ] || sh "$ROOT/scripts/fetch-fastutil.sh"
 OPENS="$(tr '\n' ' ' < "$ROOT/conf/java-opens.txt")"

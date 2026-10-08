@@ -13,7 +13,7 @@ sbt package
 sh scripts/fetch-fastutil.sh
 ```
 
-The build writes `target/scala-2.13/prism_2.13-1.0.0.jar`. Prism has one dependency that Spark does not already provide, fastutil 8.5.15, which sbt downloads into its cache. `scripts/fetch-fastutil.sh` downloads it into `jars/fastutil-8.5.15.jar` and checks its checksum. Every other library Prism uses comes from the Spark distribution.
+The build writes `target/scala-2.13/prism_2.13-0.0.1.jar`. Prism has one dependency that Spark does not already provide, fastutil 8.5.15, which sbt downloads into its cache. `scripts/fetch-fastutil.sh` downloads it into `jars/fastutil-8.5.15.jar` and checks its checksum. Every other library Prism uses comes from the Spark distribution.
 
 ## Java options
 
@@ -30,7 +30,7 @@ In local mode the driver also runs the tasks, so the jar only needs to be on the
 ```bash
 PRISM=$PWD
 $SPARK_HOME/bin/spark-submit --master 'local[4]' \
-  --driver-class-path "$PRISM/target/scala-2.13/prism_2.13-1.0.0.jar:$PRISM/jars/fastutil-8.5.15.jar" \
+  --driver-class-path "$PRISM/target/scala-2.13/prism_2.13-0.0.1.jar:$PRISM/jars/fastutil-8.5.15.jar" \
   --conf spark.sql.extensions=org.apache.spark.sql.lineage.PrismSQLExtension \
   --conf "spark.driver.extraJavaOptions=$OPENS" \
   --py-files "$PRISM/python/prism.py,$PRISM/python/recordlineage.py,$PRISM/python/fineprov.py,$PRISM/python/influence.py,$PRISM/python/influence_spark.py" \

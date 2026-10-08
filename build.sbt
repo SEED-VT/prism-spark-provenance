@@ -1,5 +1,5 @@
 ThisBuild / organization := "edu.vt.prism"
-ThisBuild / version := "1.0.0"
+ThisBuild / version := "0.0.1"
 ThisBuild / scalaVersion := "2.13.18"
 
 val sparkVersion = "4.1.2"

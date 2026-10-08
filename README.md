@@ -1,5 +1,9 @@
 # Prism
 
+[![CI](https://github.com/SEED-VT/prism-spark-provenance/actions/workflows/ci.yml/badge.svg)](https://github.com/SEED-VT/prism-spark-provenance/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SEED-VT/prism-spark-provenance)](https://github.com/SEED-VT/prism-spark-provenance/releases)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 Prism is a data provenance library for Apache Spark that traces a suspicious output of a PySpark or Spark SQL job back through the job's user-defined functions (UDFs). For a given output, it returns the input records that produced it and the fields of those records that the UDFs read. It also ranks those records by how much each one moved the output. Prism attaches to unmodified Spark 4.1 as a SQL extension, so a job needs no rewriting beyond decorating its UDFs.
 
 
@@ -57,7 +61,7 @@ Prism is enabled per session through Spark's extension setting, with its jar on 
 
 ```bash
 spark-shell \
-  --driver-class-path target/scala-2.13/prism_2.13-1.0.0.jar:jars/fastutil-8.5.15.jar \
+  --driver-class-path target/scala-2.13/prism_2.13-0.0.1.jar:jars/fastutil-8.5.15.jar \
   --conf spark.sql.extensions=org.apache.spark.sql.lineage.PrismSQLExtension \
   --conf spark.prism.sql.capture=true
 ```
@@ -92,7 +96,7 @@ Capture can also be switched on and off within a session, with `SET spark.prism.
 Prism builds with sbt 1.10 on JDK 17 against Spark 4.1.2 and Scala 2.13.
 
 ```bash
-sbt package                    # target/scala-2.13/prism_2.13-1.0.0.jar
+sbt package                    # target/scala-2.13/prism_2.13-0.0.1.jar
 sh scripts/fetch-fastutil.sh   # jars/fastutil-8.5.15.jar, the one dependency Spark lacks
 SPARK_HOME=/path/to/spark-4.1.2-bin-hadoop3 sbt test
 ```

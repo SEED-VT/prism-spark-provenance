@@ -1,0 +1,87 @@
+# Builds Prism and runs every test on each push to main and each pull request. The
+# release workflow calls this one before it publishes anything.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  SPARK_VERSION: 4.1.2
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: sbt
+
+      - uses: sbt/setup-sbt@v1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The local-cluster suite and the PySpark tests need a Spark distribution.
+      - name: Cache the Spark distribution
+        id: spark-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/spark-${{ env.SPARK_VERSION }}-bin-hadoop3
+          key: spark-${{ env.SPARK_VERSION }}-bin-hadoop3
+
+      - name: Download Spark
+        if: steps.spark-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          f=spark-$SPARK_VERSION-bin-hadoop3.tgz
+          base=https://archive.apache.org/dist/spark/spark-$SPARK_VERSION
+          curl -fsSL --retry 3 -O "$base/$f" -O "$base/$f.sha512"
+          sha512sum -c "$f.sha512"
+          tar xzf "$f" -C ~
+
+      - name: Set SPARK_HOME
+        run: echo "SPARK_HOME=$HOME/spark-$SPARK_VERSION-bin-hadoop3" >> "$GITHUB_ENV"
+
+      - name: Build the jar
+        run: sbt -batch package
+
+      - name: Fetch fastutil
+        run: sh scripts/fetch-fastutil.sh
+
+      - name: Scala tests
+        run: sbt -batch test
+
+      - name: Python and PySpark tests
+        run: sh python/tests/run.sh
+
+  demo:
+    name: Demo notebooks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the demo image
+        run: docker compose -f demo/docker-compose.yml build
+
+      - name: Run every notebook
+        run: docker compose -f demo/docker-compose.yml --profile validate run --rm validate
+
+      - name: Shut down the cluster
+        if: always()
+        run: docker compose -f demo/docker-compose.yml --profile validate down -v

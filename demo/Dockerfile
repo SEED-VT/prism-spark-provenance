@@ -1,8 +1,9 @@
 # Prism on Apache Spark 4.1.2 with JupyterLab. The first stage builds the Prism jar from
 # this repository, so the image always matches the source. The second stage runs Spark
-# from the pyspark package, which carries the Spark jars.
+# from the pyspark package, which carries the Spark jars. The jar does not depend on the
+# CPU, so the first stage runs on the build machine's platform when building for others.
 
-FROM eclipse-temurin:17-jdk-jammy AS build
+FROM --platform=$BUILDPLATFORM eclipse-temurin:17-jdk-jammy AS build
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build

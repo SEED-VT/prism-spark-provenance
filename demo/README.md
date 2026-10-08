@@ -55,3 +55,5 @@ All numbers below are from the default scale.
 All containers run the same image. The Prism jar sits on the system class path of every Spark process at `/opt/prism/jars`, because Prism's lineage lookup sends code that Spark deserializes with the system class loader. The settings live in `spark-defaults.conf`, which also turns on the Prism extension and the Java 17 module options that Spark needs. A shared volume is mounted at `/data` in every container, so the executors read the tables that the notebooks write.
 
 To run a notebook outside Compose, start the image on its own with `docker run --rm -p 8888:8888 prism-demo`. The notebooks then use Spark in local mode on that one container.
+
+Each release also publishes the image to the GitHub Container Registry for amd64 and arm64, so a single container needs no build. For example, `docker run --rm -p 8888:8888 ghcr.io/seed-vt/prism-demo:0.0.1` starts JupyterLab with release 0.0.1.
