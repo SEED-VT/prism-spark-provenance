@@ -76,5 +76,28 @@ check("python-udf witnesses",
 t.release_lineage(df2)
 check("release lineage", len(t.trace(df2, [g_id]).ids) == 0)
 
+# ---- 4. lazy-cell witnesses annotated on the cluster while capture is on -----
+from pyspark.sql.types import IntegerType
+from prism import Prism, udf as traced_udf
+
+
+@traced_udf(IntegerType())
+def with_fee(amount):
+    return amount + 7
+
+
+p = Prism(spark)
+p.enable_capture()
+p.enable_udf_aware(with_fee, mode="lazy-cell")
+df3 = spark.table("sales").withColumn("amt3", with_fee("amount")).groupBy("category").sum("amt3")
+out3 = p.collect_with_lineage(df3)
+g3 = next(i for r, i in out3 if r["category"] == "groceries")
+os.environ["LAZY_CELL_DRIVER_MAX"] = "0"
+w3 = p.trace(df3, [g3]).go_back().show()
+del os.environ["LAZY_CELL_DRIVER_MAX"]
+check("lazy-cell witnesses on the cluster",
+      sorted(w["amount"] for w in w3) == [70, 80, 95, 110]
+      and all(w.get("_data") == ["amount"] for w in w3), str(w3))
+
 print("ALL %d PYSPARK TESTS PASSED" % len(passed))
 spark.stop()

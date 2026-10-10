@@ -11,5 +11,5 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 "$PYSPARK_PYTHON" "$ROOT/benchmarks/microbench/provenance_bench.py"
 
 export PYTHONPATH="$ROOT/python:$PYTHONPATH"
-prism_submit --py-files "$ROOT/python/recordlineage.py" \
+prism_submit --py-files "$ROOT/python/recordlineage.py,$ROOT/python/prism.py,$ROOT/python/fineprov.py,$ROOT/python/influence.py,$ROOT/python/influence_spark.py" \
   "$ROOT/python/tests/test_lineage_pyspark.py"

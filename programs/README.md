@@ -1,0 +1,1 @@
+Run `programs/submit.sh programs/<program>/run.py <data_dir> [--prism]` or `programs/submit.sh programs/<program>/measure.py <data_dir>`, where `<data_dir>` holds the tables from `benchmarks/disc/gen.py` or `benchmarks/tpcds/gen.py`.

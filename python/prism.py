@@ -376,8 +376,14 @@ class _PrismCursor:
             cname = "__code%d" % s
             df = df.withColumn(cname, _prov_udf(fn, prm)(*[_F.col(p) for p in prm]))
             codecols.append(cname)
-        by_i = {row["__i"]: [row[c] for c in codecols]
-                for row in df.select(["__i"] + codecols).collect()}
+        # The witness table is Prism's own query, so it runs without capture.
+        prev = spark.conf.get("spark.prism.sql.capture", "false")
+        spark.conf.set("spark.prism.sql.capture", "false")
+        try:
+            coded = df.select(["__i"] + codecols).collect()
+        finally:
+            spark.conf.set("spark.prism.sql.capture", prev)
+        by_i = {row["__i"]: [row[c] for c in codecols] for row in coded}
         for i, rec in enumerate(records):
             vec = by_i.get(i)
             if not vec:
