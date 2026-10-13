@@ -95,6 +95,13 @@ object PrismSQL {
   case class HashBranch(preTapId: Int, upstream: SourceInfo) extends BranchLink
   /** Same-pipeline probe side of a broadcast join, where ids are exact. */
   case class DirectBranch(upstream: SourceInfo) extends BranchLink
+  /**
+   * Join input across a shuffle or broadcast whose pre tap records row hashes. A hop keeps
+   * only the input rows whose key hash and row hash match the joined output rows. `side`
+   * is 0 or 1 for a shuffle join's left or right input and is unused for a broadcast
+   * join's build side.
+   */
+  case class RowBranch(preTapId: Int, side: Int, upstream: SourceInfo) extends BranchLink
 
   case class CaptureGraph(spark: SparkSession, resultTapId: Int, source: SourceInfo)
 
@@ -155,6 +162,22 @@ object PrismSQL {
           }
         KeyedSource(t.tapId, hasProbe = false, branches)
     }
+    case t: TapPostShuffleJoinExec =>
+      // Each input normally arrives through its own shuffle. Inputs that were already
+      // partitioned have no shuffle of their own, so the level falls back to key hashes.
+      val join = t.child.collectFirst {
+        case j: org.apache.spark.sql.execution.joins.SortMergeJoinExec => j: SparkPlan
+        case j: org.apache.spark.sql.execution.joins.ShuffledHashJoinExec => j: SparkPlan
+      }.getOrElse(throw new IllegalStateException(s"No shuffle join under tap:\n$t"))
+      val sides = join.children.map(directShuffles)
+      if (sides.forall(_.length == 1)) {
+        KeyedSource(t.tapId, hasProbe = false, sides.zipWithIndex.map { case (sh, i) =>
+          val hb = parseBranch(sh.head)
+          if (preTapOf(sh.head).rowHash) RowBranch(hb.preTapId, i, hb.upstream) else hb
+        })
+      } else {
+        KeyedSource(t.tapId, hasProbe = false, directShuffles(t.child).map(parseBranch))
+      }
     case t: TapPostBroadcastJoinExec =>
       val bhj = t.child.asInstanceOf[
         org.apache.spark.sql.execution.joins.BroadcastHashJoinExec]
@@ -162,7 +185,7 @@ object PrismSQL {
         bhj.buildSide == org.apache.spark.sql.catalyst.optimizer.BuildLeft
       val (buildPlan, probePlan) =
         if (buildOnLeft) (bhj.left, bhj.right) else (bhj.right, bhj.left)
-      val buildBranch = parseBroadcastBranch(buildPlan)
+      val buildBranch = parseBroadcastBranch(buildPlan, t.buildAttrs.nonEmpty)
       // The probe side shares this pipeline's tasks, so any union offset carries over.
       val probeBranch = DirectBranch(parseSource(probePlan, partOffset))
       // Branch indices follow logical join inputs, 0 for left and 1 for right.
@@ -186,7 +209,7 @@ object PrismSQL {
         s"Cannot parse capture graph at ${other.getClass.getSimpleName}:\n$other")
   }
 
-  private def parseBroadcastBranch(p: SparkPlan): HashBranch = {
+  private def parseBroadcastBranch(p: SparkPlan, exact: Boolean): BranchLink = {
     val exchangeChild = p.collectFirst {
       case b: org.apache.spark.sql.execution.exchange.BroadcastExchangeExec => b.child
     }.orElse {
@@ -202,7 +225,8 @@ object PrismSQL {
     val pre = firstPreTap(exchangeChild).getOrElse {
       throw new IllegalStateException(s"No pre tap under broadcast:\n$exchangeChild")
     }
-    HashBranch(pre.tapId, parseSource(pre.child))
+    if (exact && pre.rowHash) RowBranch(pre.tapId, -1, parseSource(pre.child))
+    else HashBranch(pre.tapId, parseSource(pre.child))
   }
 
   /** Shuffle boundaries directly feeding this operator (not nested deeper ones). */
@@ -213,6 +237,12 @@ object PrismSQL {
   }
 
   private def parseBranch(shuffle: SparkPlan): HashBranch = {
+    val pre = preTapOf(shuffle)
+    HashBranch(pre.tapId, parseSource(pre.child))
+  }
+
+  /** The pre-exchange tap on the map side of `shuffle`. */
+  private def preTapOf(shuffle: SparkPlan): TapPreExchangeExec = {
     val mapSide = shuffle match {
       case s: ShuffleQueryStageExec => s.plan match {
         case e: ShuffleExchangeExec => e.child
@@ -221,10 +251,9 @@ object PrismSQL {
       case e: ShuffleExchangeExec => e.child
       case p => p
     }
-    val pre = firstPreTap(mapSide).getOrElse {
+    firstPreTap(mapSide).getOrElse {
       throw new IllegalStateException(s"No pre-exchange tap under shuffle:\n$mapSide")
     }
-    HashBranch(pre.tapId, parseSource(pre.child))
   }
 
   /**
@@ -246,7 +275,7 @@ object PrismSQL {
   private def directPreTaps(p: SparkPlan): Seq[TapPreExchangeExec] = p match {
     case t: TapPreExchangeExec => Seq(t)
     case _: ShuffleQueryStageExec | _: ShuffleExchangeExec => Nil
-    case _: TapPostKeyedExec | _: TapPostBroadcastJoinExec => Nil
+    case _: TapPostKeyedExec | _: TapPostBroadcastJoinExec | _: TapPostShuffleJoinExec => Nil
     case other => other.children.flatMap(directPreTaps)
   }
 
@@ -537,6 +566,50 @@ object PrismSQL {
     count.value
   }
 
+  // Exact join hops. A join level stores, per output row, the key hash and row hash of
+  // each input row it matched. The input's pre tap stores the same pair per input id.
+
+  /** Key hash to row hashes of the `side` input rows matched by the level rows `idSet`. */
+  private[lineage] def joinRowsOf(
+      spark: SparkSession, tapId: Int, side: Int, idSet: Set[Long]): Map[Int, Set[Long]] =
+    mapBlocks(spark, tapId) { b =>
+      val (split, keys, rows) = TapBlock.joinRows(b, side)
+      keys.indices.iterator.collect {
+        case i if idSet.contains(PackIntIntoLong(split, i)) => (keys(i), rows(i))
+      }
+    }.groupBy(_._1).map { case (k, v) => k -> v.map(_._2).toSet }
+
+  /** Packed input ids of a row-hash pre tap block whose (key hash, row hash) is wanted. */
+  private[lineage] def preRowMatches(wanted: Map[Int, Set[Long]]): TapBlock => Iterator[Long] = {
+    b =>
+      val (split, hashes, idLists, rowLists) = TapBlock.rowPreEntries(b)
+      wanted.iterator.flatMap { case (h, rs) =>
+        val j = java.util.Arrays.binarySearch(hashes, h)
+        if (j < 0) Iterator.empty
+        else idLists(j).indices.iterator.collect {
+          case k if rs.contains(rowLists(j)(k)) => PackIntIntoLong(split, idLists(j)(k))
+        }
+      }
+  }
+
+  /** Pairs of packed output id and (key hash, row hash) of one input of a join level. */
+  private[lineage] def levelJoinRowRDD(
+      spark: SparkSession, tapId: Int, side: Int): RDD[(Long, (Int, Long))] =
+    tapBlocks[TapBlock](spark, tapId).flatMap { b =>
+      val (split, keys, rows) = TapBlock.joinRows(b, side)
+      keys.indices.iterator.map(i => (PackIntIntoLong(split, i), (keys(i), rows(i))))
+    }
+
+  /** Pairs of (key hash, row hash) and packed input id for a row-hash pre tap. */
+  private[lineage] def preRowIdRDD(spark: SparkSession, preTapId: Int): RDD[((Int, Long), Long)] =
+    tapBlocks[TapBlock](spark, preTapId).flatMap { b =>
+      val (split, hashes, idLists, rowLists) = TapBlock.rowPreEntries(b)
+      hashes.indices.iterator.flatMap { j =>
+        idLists(j).indices.iterator.map(k =>
+          ((hashes(j), rowLists(j)(k)), PackIntIntoLong(split, idLists(j)(k))))
+      }
+    }
+
   // Lifecycle and py4j API.
 
   private def allTapIds(graph: CaptureGraph): Seq[Int] = {
@@ -545,6 +618,7 @@ object PrismSQL {
       case UnionSource(children, _, _) => children.flatMap(tapIds)
       case KeyedSource(id, _, branches) => id +: branches.flatMap {
         case HashBranch(pre, up) => pre +: tapIds(up)
+        case RowBranch(pre, _, up) => pre +: tapIds(up)
         case DirectBranch(up) => tapIds(up)
       }
     }
@@ -779,6 +853,9 @@ class TraceCursor private[lineage] (
               else Iterator.empty
             }
           }.distinct
+        case RowBranch(preTapId, side, _) =>
+          val wanted = PrismSQL.joinRowsOf(spark, tapId, side, idSet)
+          PrismSQL.mapBlocks(spark, preTapId)(PrismSQL.preRowMatches(wanted)).distinct
       }
       new TraceCursor(spark, branches(branch).upstream, nextIds,
         (source, ids, branch) :: path)
@@ -814,6 +891,9 @@ class TraceCursor private[lineage] (
               else Iterator.empty
             }
           }
+        case RowBranch(preTapId, side, _) =>
+          val wanted = PrismSQL.joinRowsOf(spark, ks.tapId, side, idSet)
+          PrismSQL.mapBlocksTake(spark, preTapId, cap + 1)(PrismSQL.preRowMatches(wanted))
       }
       if (raw.length > cap) None
       else Some(new TraceCursor(spark, branches(branch).upstream, raw.distinct,
@@ -868,6 +948,24 @@ class TraceCursor private[lineage] (
               }
             }.toSet
           idsForKeyHashes(parent, hashes)
+        case RowBranch(preTapId, side, _) =>
+          // The (key hash, row hash) pairs of the current input ids, then every level row
+          // that matched one of them on this side.
+          val pairs = PrismSQL.mapBlocks(spark, preTapId) { b =>
+            val (split, hashes, idLists, rowLists) = TapBlock.rowPreEntries(b)
+            hashes.indices.iterator.flatMap { j =>
+              idLists(j).indices.iterator.collect {
+                case k if idSet.contains(PackIntIntoLong(split, idLists(j)(k))) =>
+                  (hashes(j), rowLists(j)(k))
+              }
+            }
+          }.toSet
+          PrismSQL.mapBlocks(spark, parent.tapId) { b =>
+            val (split, keys, rows) = TapBlock.joinRows(b, side)
+            keys.indices.iterator.collect {
+              case i if pairs.contains((keys(i), rows(i))) => PackIntIntoLong(split, i)
+            }
+          }
       }
       new TraceCursor(spark, parent, parentIds, rest)
     case _ => throw new IllegalStateException("corrupt trace path")
@@ -986,6 +1084,14 @@ class TraceCursor private[lineage] (
             case DirectBranch(up) =>
               val level = directPairsRDD(spark, tapId)
               frontier = frontier.map(id => (id, ())).join(level, par)
+                .map { case (_, (_, inId)) => inId }.distinct(par)
+              src = up
+            case RowBranch(preTapId, side, up) =>
+              val level = levelJoinRowRDD(spark, tapId, side)
+              val pre = preRowIdRDD(spark, preTapId)
+              val rows = frontier.map(id => (id, ())).join(level, par)
+                .map { case (_, (_, kr)) => kr }.distinct(par)
+              frontier = rows.map(kr => (kr, ())).join(pre, par)
                 .map { case (_, (_, inId)) => inId }.distinct(par)
               src = up
             case HashBranch(preTapId, up) =>

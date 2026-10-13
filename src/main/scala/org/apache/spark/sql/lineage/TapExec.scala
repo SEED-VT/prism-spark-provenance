@@ -19,7 +19,7 @@ package org.apache.spark.sql.lineage
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, BindReferences, Cast, Expression, UnsafeProjection}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, BindReferences, Cast, Expression, UnsafeProjection, UnsafeRow, XXH64}
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode, GenerateUnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.{CodegenSupport, SparkPlan, UnaryExecNode}
@@ -72,6 +72,28 @@ case class TapScanExec(child: SparkPlan) extends PrismTapExec {
 }
 
 /**
+ * 64-bit hash of a row's full projection. A join's post tap and the pre taps below its
+ * inputs hash the same attributes, so equal hashes identify the input row a match used.
+ */
+object RowHash {
+  def of(r: UnsafeRow): Long =
+    XXH64.hashUnsafeBytes(r.getBaseObject, r.getBaseOffset, r.getSizeInBytes, 42L)
+
+  /** Generated code that evaluates the row hash of `attrs` over the current input. */
+  def code(ctx: CodegenContext, input: Seq[ExprCode], attrs: Seq[Expression],
+      childOutput: Seq[Attribute]): (String, String) = {
+    ctx.currentVars = input
+    val ev = GenerateUnsafeProjection.createCode(
+      ctx, BindReferences.bindReferences[Expression](attrs, childOutput))
+    val h = ctx.freshName("prismRowHash")
+    (s"""
+        |${ev.code}
+        |long $h = ${RowHash.getClass.getName.stripSuffix("$")}.of(${ev.value});
+      """.stripMargin, h)
+  }
+}
+
+/**
  * Base for taps that hash a key projection per row (pre-exchange and post-keyed).
  * The hash is the murmur3 `UnsafeRow.hashCode` of the projected key, which is stable for
  * equal values and allocates no strings.
@@ -116,21 +138,37 @@ trait KeyedTapExec extends PrismTapExec {
 case class TapPreExchangeExec(
     tapId: Int, keyExprs: Seq[Expression], child: SparkPlan,
     valueExprs: Seq[Expression] = Nil,
-    focus: Option[Expression] = None)
+    focus: Option[Expression] = None,
+    rowHash: Boolean = false)
   extends KeyedTapExec {
 
+  // `rowHash` marks a join input. Each row then also records the hash of its full
+  // projection, which lets a trace select exact matches. See [[RowPreExchangeTapRuntime]].
   override protected def runtimeClass: Class[_] =
     if (valueExprs.nonEmpty) classOf[InfluencePreExchangeTapRuntime]
+    else if (rowHash) classOf[RowPreExchangeTapRuntime]
     else classOf[PreExchangeTapRuntime]
 
   // When `focus` is set (a Boolean predicate on the group key, resolved against
   // child.output), a row records lineage only if the predicate holds. The row always
   // flows downstream unchanged.
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    // The row hash reads every input column, so the inputs are evaluated once up front.
+    val inputsEval = if (rowHash && valueExprs.isEmpty) evaluateVariables(input) else ""
     ctx.currentVars = input
     val boundKeys = BindReferences.bindReferences[Expression](keyExprs, child.output)
     val keyEv = GenerateUnsafeProjection.createCode(ctx, boundKeys)
-    val record = if (valueExprs.isEmpty) {
+    val record = if (valueExprs.isEmpty && rowHash) {
+      val tap = ctx.addMutableState(runtimeClass.getName, "prismRowTap",
+        v => s"$v = new ${runtimeClass.getName}($tapId);")
+      val (rowCode, h) = RowHash.code(ctx, input, child.output, child.output)
+      s"""
+         |$inputsEval
+         |${keyEv.code}
+         |$rowCode
+         |$tap.tap(${keyEv.value}.hashCode(), $h);
+       """.stripMargin
+    } else if (valueExprs.isEmpty) {
       val tap = ctx.addMutableState(runtimeClass.getName, "prismKeyedTap",
         v => s"$v = new ${runtimeClass.getName}($tapId);")
       s"""
@@ -180,7 +218,14 @@ case class TapPreExchangeExec(
     val childOutput = child.output
     val tid = tapId
     val focusExpr = focus
-    if (valueExprs.isEmpty) {
+    if (valueExprs.isEmpty && rowHash) {
+      child.execute().mapPartitionsInternal { iter =>
+        val proj = UnsafeProjection.create(keys, childOutput)
+        val rproj = UnsafeProjection.create(childOutput, childOutput)
+        val tap = new RowPreExchangeTapRuntime(tid)
+        iter.map { r => tap.tap(proj(r).hashCode(), RowHash.of(rproj(r))); r }
+      }
+    } else if (valueExprs.isEmpty) {
       child.execute().mapPartitionsInternal { iter =>
         val proj = UnsafeProjection.create(keys, childOutput)
         val pred = focusExpr.map(f => org.apache.spark.sql.catalyst.expressions
@@ -232,6 +277,53 @@ case class TapPostKeyedExec(tapId: Int, keyExprs: Seq[Expression], child: SparkP
 }
 
 /**
+ * Above a sort-merge or shuffled hash join, records each output row's join key hash and
+ * the row hashes of its left and right inputs. `leftAttrs` and `rightAttrs` are the
+ * join's input schemas, the same attributes the pre taps below its exchanges hash.
+ */
+case class TapPostShuffleJoinExec(
+    tapId: Int, keyExprs: Seq[Expression], leftAttrs: Seq[Attribute],
+    rightAttrs: Seq[Attribute], child: SparkPlan)
+  extends KeyedTapExec {
+
+  override protected def runtimeClass: Class[_] = classOf[PostShuffleJoinTapRuntime]
+
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val tap = ctx.addMutableState(
+      runtimeClass.getName, "prismJoinTap",
+      v => s"$v = new ${runtimeClass.getName}($tapId);")
+    val inputsEval = evaluateVariables(input)
+    ctx.currentVars = input
+    val boundKeys = BindReferences.bindReferences[Expression](keyExprs, child.output)
+    val keyEv = GenerateUnsafeProjection.createCode(ctx, boundKeys)
+    val (lCode, lh) = RowHash.code(ctx, input, leftAttrs, child.output)
+    val (rCode, rh) = RowHash.code(ctx, input, rightAttrs, child.output)
+    s"""
+       |$inputsEval
+       |${keyEv.code}
+       |$lCode
+       |$rCode
+       |$tap.tap(${keyEv.value}.hashCode(), $lh, $rh);
+       |${consume(ctx, input)}
+     """.stripMargin
+  }
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    val (keys, la, ra, childOutput, tid) = (keyExprs, leftAttrs, rightAttrs, child.output, tapId)
+    child.execute().mapPartitionsInternal { iter =>
+      val kp = UnsafeProjection.create(keys, childOutput)
+      val lp = UnsafeProjection.create(la, childOutput)
+      val rp = UnsafeProjection.create(ra, childOutput)
+      val tap = new PostShuffleJoinTapRuntime(tid)
+      iter.map { r => tap.tap(kp(r).hashCode(), RowHash.of(lp(r)), RowHash.of(rp(r))); r }
+    }
+  }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): TapPostShuffleJoinExec =
+    copy(child = newChild)
+}
+
+/**
  * Saves the probe row's id into the join's mark slot as it enters a BroadcastHashJoin.
  * A fan-out join emits matches depth-first, so downstream taps of the first match have
  * already overwritten `currentInputId` when the second match emerges.
@@ -266,7 +358,8 @@ case class TapProbeMarkExec(pairId: Int, child: SparkPlan) extends PrismTapExec 
  * [[TapProbeMarkExec]] with the same `pairId`.
  */
 case class TapPostBroadcastJoinExec(
-    tapId: Int, pairId: Int, keyExprs: Seq[Expression], child: SparkPlan)
+    tapId: Int, pairId: Int, keyExprs: Seq[Expression], child: SparkPlan,
+    buildAttrs: Seq[Attribute] = Nil)
   extends KeyedTapExec {
 
   override protected def runtimeClass: Class[_] = classOf[PostJoinTapRuntime]
@@ -275,12 +368,22 @@ case class TapPostBroadcastJoinExec(
     val tap = ctx.addMutableState(
       runtimeClass.getName, "prismKeyedTap",
       v => s"$v = new ${runtimeClass.getName}($tapId, $pairId);")
+    val inputsEval = if (buildAttrs.isEmpty) "" else evaluateVariables(input)
     ctx.currentVars = input
     val boundKeys = BindReferences.bindReferences[Expression](keyExprs, child.output)
     val keyEv = GenerateUnsafeProjection.createCode(ctx, boundKeys)
+    // With `buildAttrs`, the tap also records the matched build row's hash.
+    val (bCode, call) =
+      if (buildAttrs.isEmpty) ("", s"$tap.tap(${keyEv.value}.hashCode());")
+      else {
+        val (c, h) = RowHash.code(ctx, input, buildAttrs, child.output)
+        (c, s"$tap.tap(${keyEv.value}.hashCode(), $h);")
+      }
     s"""
+       |$inputsEval
        |${keyEv.code}
-       |$tap.tap(${keyEv.value}.hashCode());
+       |$bCode
+       |$call
        |${consume(ctx, input)}
      """.stripMargin
   }
@@ -288,11 +391,17 @@ case class TapPostBroadcastJoinExec(
   override protected def doExecute(): RDD[InternalRow] = {
     val keys = keyExprs
     val childOutput = child.output
+    val build = buildAttrs
     val (tid, pid) = (tapId, pairId)
     child.execute().mapPartitionsInternal { iter =>
       val proj = UnsafeProjection.create(keys, childOutput)
+      val bproj = if (build.isEmpty) null else UnsafeProjection.create(build, childOutput)
       val tap = new PostJoinTapRuntime(tid, pid)
-      iter.map { r => tap.tap(proj(r).hashCode()); r }
+      iter.map { r =>
+        if (bproj == null) tap.tap(proj(r).hashCode())
+        else tap.tap(proj(r).hashCode(), RowHash.of(bproj(r)))
+        r
+      }
     }
   }
 

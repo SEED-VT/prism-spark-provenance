@@ -69,8 +69,11 @@ class PrismUnsupportedOperatorException(plan: SparkPlan)
  *  - `TapPreExchangeExec` goes on the map side of every shuffle. It sits below the partial
  *    aggregate when one exists, keyed by its grouping expressions, and otherwise directly
  *    below the exchange, keyed by its hash-partitioning expressions.
- *  - `TapPostKeyedExec` goes above every final aggregate and shuffle join, keyed by
- *    grouping or join keys evaluated on the operator output.
+ *  - `TapPostKeyedExec` goes above every final aggregate, keyed by grouping keys
+ *    evaluated on the operator output.
+ *  - `TapPostShuffleJoinExec` goes above every shuffle join whose output carries both
+ *    inputs. It records the join key hash and the row hash of each matched input row, and
+ *    the pre taps below join inputs record row hashes, so a trace selects exact matches.
  *  - `TapResultExec` goes at the root of the final (non-exchange-rooted) stage.
  *
  * Any operator outside the supported set raises [[PrismUnsupportedOperatorException]].
@@ -212,8 +215,10 @@ case class InsertPrismTaps(session: SparkSession) extends Rule[SparkPlan] with L
           if (!idSafeFromShuffle(other)) {
             throw new PrismUnsupportedOperatorException(ex)
           }
-          ex.withNewChildren(
-            Seq(TapPreExchangeExec(session.sparkContext.newRddId(), keys, other)))
+          // An exchange without a partial aggregate usually feeds a join, so its tap
+          // also records row hashes for exact join lineage.
+          ex.withNewChildren(Seq(TapPreExchangeExec(
+            session.sparkContext.newRddId(), keys, other, rowHash = true)))
       }
 
       // Build side of a broadcast join, keyed by the rewritten key hash.
@@ -223,8 +228,8 @@ case class InsertPrismTaps(session: SparkSession) extends Rule[SparkPlan] with L
           if (!idSafeFromShuffle(bex.child)) {
             throw new PrismUnsupportedOperatorException(bex)
           }
-          bex.withNewChildren(
-            Seq(TapPreExchangeExec(session.sparkContext.newRddId(), keys, bex.child)))
+          bex.withNewChildren(Seq(TapPreExchangeExec(
+            session.sparkContext.newRddId(), keys, bex.child, rowHash = true)))
         case _ => throw new PrismUnsupportedOperatorException(bex)
       }
     }
@@ -296,12 +301,10 @@ case class InsertPrismTaps(session: SparkSession) extends Rule[SparkPlan] with L
         }
 
       case j: SortMergeJoinExec =>
-        TapPostKeyedExec(session.sparkContext.newRddId(),
-          shuffleJoinKeys(j.joinType, j.leftKeys, j.rightKeys), j)
+        shuffleJoinTap(j, j.joinType, j.leftKeys, j.rightKeys)
 
       case j: ShuffledHashJoinExec =>
-        TapPostKeyedExec(session.sparkContext.newRddId(),
-          shuffleJoinKeys(j.joinType, j.leftKeys, j.rightKeys), j)
+        shuffleJoinTap(j, j.joinType, j.leftKeys, j.rightKeys)
 
       case j: BroadcastHashJoinExec =>
         // Streamed keys are rewritten like the broadcast mode's build keys, so the
@@ -323,8 +326,12 @@ case class InsertPrismTaps(session: SparkSession) extends Rule[SparkPlan] with L
         val joined =
           if (buildRight) j.withNewChildren(Seq(marked, j.right))
           else j.withNewChildren(Seq(j.left, marked))
+        // When the output carries the build row, its hash is recorded for exact matches.
+        val buildPlan = if (buildRight) j.right else j.left
+        val buildAttrs =
+          if (keepsBothSides(j.joinType)) buildPlan.output else Nil
         TapPostBroadcastJoinExec(tapId, tapId,
-          PrismJoinKeys.rewrite(streamedKeys), joined)
+          PrismJoinKeys.rewrite(streamedKeys), joined, buildAttrs)
 
       case w: WindowExec if isReduceSide(w.child) =>
         // Keys outputs by the partition spec (peer-set granularity).
@@ -376,7 +383,8 @@ case class InsertPrismTaps(session: SparkSession) extends Rule[SparkPlan] with L
       case _: Exchange => tapped
       case _ if tapped.isInstanceOf[TapResultExec] => tapped
       case _ if !tapped.exists(_.isInstanceOf[TapScanExec]) &&
-                !tapped.exists(_.isInstanceOf[TapPostKeyedExec]) => tapped
+                !tapped.exists(_.isInstanceOf[TapPostKeyedExec]) &&
+                !tapped.exists(_.isInstanceOf[TapPostShuffleJoinExec]) => tapped
       case root =>
         if (!idSafeFromShuffle(root)) {
           throw new PrismUnsupportedOperatorException(root)
@@ -421,7 +429,7 @@ case class InsertPrismTaps(session: SparkSession) extends Rule[SparkPlan] with L
     case _: BaseAggregateExec | _: SortMergeJoinExec | _: ShuffledHashJoinExec |
          _: BroadcastHashJoinExec | _: WindowExec |
          _: TakeOrderedAndProjectExec => true
-    case _: TapPostKeyedExec | _: TapPostBroadcastJoinExec => true
+    case _: TapPostKeyedExec | _: TapPostBroadcastJoinExec | _: TapPostShuffleJoinExec => true
     case leaf if leaf.children.isEmpty => true
     case other => other.children.forall(idSafeFromShuffle)
   }
@@ -455,6 +463,27 @@ case class InsertPrismTaps(session: SparkSession) extends Rule[SparkPlan] with L
 
   private val supportedJoinTypes: Set[JoinType] =
     Set(Inner, LeftOuter, RightOuter, FullOuter, LeftSemi, LeftAnti)
+
+  /** Join types whose output rows carry the columns of both inputs. */
+  private def keepsBothSides(joinType: JoinType): Boolean =
+    joinType == Inner || joinType == LeftOuter || joinType == RightOuter ||
+      joinType == FullOuter
+
+  /**
+   * Post tap for a shuffle join. Joins that keep both inputs record exact row matches.
+   * Semi and anti joins drop the right input's columns, so they keep key-level lineage.
+   */
+  private def shuffleJoinTap(
+      j: SparkPlan, joinType: JoinType,
+      leftKeys: Seq[Expression], rightKeys: Seq[Expression]): SparkPlan = {
+    val keys = shuffleJoinKeys(joinType, leftKeys, rightKeys)
+    if (keepsBothSides(joinType)) {
+      TapPostShuffleJoinExec(session.sparkContext.newRddId(), keys,
+        j.children(0).output, j.children(1).output, j)
+    } else {
+      TapPostKeyedExec(session.sparkContext.newRddId(), keys, j)
+    }
+  }
 
   /**
    * Key expressions to hash on a shuffle join's output. Matched rows can use either
@@ -503,7 +532,8 @@ case class InsertPrismTaps(session: SparkSession) extends Rule[SparkPlan] with L
   /** True when `p` reads from an exchange, as final aggregate and join inputs do. */
   private def isReduceSide(p: SparkPlan): Boolean = p match {
     case _: ShuffleQueryStageExec | _: ShuffleExchangeExec | _: AQEShuffleReadExec => true
-    case _: SortExec | _: ProjectExec | _: FilterExec | _: TapPostKeyedExec =>
+    case _: SortExec | _: ProjectExec | _: FilterExec | _: TapPostKeyedExec |
+         _: TapPostShuffleJoinExec =>
       p.children.exists(isReduceSide)
     case _ => false
   }

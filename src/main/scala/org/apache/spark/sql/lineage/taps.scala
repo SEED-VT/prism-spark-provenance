@@ -41,8 +41,20 @@ private[lineage] sealed trait TapBlock extends Serializable { def split: Int }
  */
 private[lineage] case class KeyedBlock(split: Int, values: Array[Int]) extends TapBlock
 
-/** Broadcast-join tap block: pairs(i) packs (keyHash, probeInputId) for row i. */
-private[lineage] case class JoinBlock(split: Int, pairs: Array[Long]) extends TapBlock
+/**
+ * Broadcast-join tap block: pairs(i) packs (keyHash, probeInputId) for row i. When
+ * `buildRows` is set, buildRows(i) is the row hash of the build row that row i matched.
+ */
+private[lineage] case class JoinBlock(
+    split: Int, pairs: Array[Long], buildRows: Array[Long] = null) extends TapBlock
+
+/**
+ * Shuffle-join tap block. Row i has join key hash keys(i), and left(i) and right(i) are
+ * the row hashes of the two input rows it joined (the hash of an all-null row for the
+ * missing side of an outer join).
+ */
+private[lineage] case class ShuffleJoinBlock(
+    split: Int, keys: Array[Int], left: Array[Long], right: Array[Long]) extends TapBlock
 
 /**
  * Pre-exchange tap block. Hashes are sorted ascending for binary search, and
@@ -50,6 +62,15 @@ private[lineage] case class JoinBlock(split: Int, pairs: Array[Long]) extends Ta
  */
 private[lineage] case class PreExchangeBlock(
     split: Int, hashes: Array[Int], idLists: Array[Array[Int]]) extends TapBlock
+
+/**
+ * Pre-exchange tap block below a join input. Like [[PreExchangeBlock]], and rowLists(j)(k)
+ * is the row hash of input id idLists(j)(k), so a trace can select the exact rows a join
+ * output matched instead of every row with the same key.
+ */
+private[lineage] case class RowPreExchangeBlock(
+    split: Int, hashes: Array[Int], idLists: Array[Array[Int]],
+    rowLists: Array[Array[Long]]) extends TapBlock
 
 /**
  * Pre-exchange tap block that also carries influence for `nAgg` aggregates.
@@ -99,13 +120,14 @@ private[lineage] object TapBlock {
 
   def keyedValues(b: TapBlock): (Int, Array[Int]) = b match {
     case KeyedBlock(s, v) => (s, v)
+    case ShuffleJoinBlock(s, k, _, _) => (s, k)
     case BoxedKeyedBlock(s, rows) =>
       (s, rows.map(_.asInstanceOf[(Long, Long)]._2.toInt))
     case other => throw new IllegalStateException(s"not a keyed block: $other")
   }
 
   def joinPairs(b: TapBlock): (Int, Array[Long]) = b match {
-    case JoinBlock(s, p) => (s, p)
+    case JoinBlock(s, p, _) => (s, p)
     case BoxedJoinBlock(s, rows) =>
       (s, rows.map { r =>
         val (_, hp) = r.asInstanceOf[(Long, (Int, Int))]
@@ -116,12 +138,32 @@ private[lineage] object TapBlock {
 
   def preEntries(b: TapBlock): (Int, Array[Int], Array[Array[Int]]) = b match {
     case PreExchangeBlock(s, h, ids) => (s, h, ids)
+    case RowPreExchangeBlock(s, h, ids, _) => (s, h, ids)
     case InfluencePreExchangeBlock(s, h, ids, _, _) => (s, h, ids)
     case BoxedPreExchangeBlock(s, rows) =>
       val typed = rows.map(_.asInstanceOf[(Int, Array[Int])])
       (s, typed.map(_._1), typed.map(_._2))
     case other => throw new IllegalStateException(s"not a pre-exchange block: $other")
   }
+
+  /**
+   * Key hash and row hash of one join input for every output row of a join level.
+   * `side` is 0 or 1 (left or right) for a shuffle join and is ignored for a broadcast
+   * join, whose recorded row hash is always the build side's.
+   */
+  def joinRows(b: TapBlock, side: Int): (Int, Array[Int], Array[Long]) = b match {
+    case ShuffleJoinBlock(s, k, l, r) => (s, k, if (side == 0) l else r)
+    case JoinBlock(s, p, rows) if rows != null =>
+      (s, p.map(x => PackIntIntoLong.getLeft(x)), rows)
+    case other => throw new IllegalStateException(s"not a row-hash join block: $other")
+  }
+
+  /** Hashes, parallel idLists, and parallel row-hash lists of a join-input pre tap. */
+  def rowPreEntries(b: TapBlock): (Int, Array[Int], Array[Array[Int]], Array[Array[Long]]) =
+    b match {
+      case RowPreExchangeBlock(s, h, ids, rows) => (s, h, ids, rows)
+      case other => throw new IllegalStateException(s"not a row-hash pre block: $other")
+    }
 
   /**
    * Hashes, parallel idLists, and member-major valLists with stride `nAgg`. Only an
@@ -173,6 +215,41 @@ class PreExchangeTapRuntime(tapId: Int) {
 
   /** Called once per pre-combine row with the murmur hash of its partition/group key. */
   def tap(keyHash: Int): Unit = map.put(keyHash, state.currentInputId)
+}
+
+/**
+ * Pre-exchange tap below a join input. Per key hash it keeps the input ids and, in
+ * parallel, each row's 64-bit row hash, which the join's post tap records per match.
+ */
+class RowPreExchangeTapRuntime(tapId: Int) {
+  private val ctx = TaskContext.get()
+  private val state = LineageTaskState.get(ctx)
+  private val split = ctx.partitionId()
+  private val ids =
+    new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap[
+      it.unimi.dsi.fastutil.ints.IntArrayList](16384)
+  private val rows =
+    new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap[
+      it.unimi.dsi.fastutil.longs.LongArrayList](16384)
+
+  ctx.addTaskCompletionListener[Unit] { _ =>
+    val hashes = ids.keySet().toIntArray
+    java.util.Arrays.sort(hashes)
+    TapBlock.store(tapId, split, RowPreExchangeBlock(split, hashes,
+      hashes.map(h => ids.get(h).toIntArray), hashes.map(h => rows.get(h).toLongArray)))
+  }
+
+  /** Called once per row with its partition key hash and its row hash. */
+  def tap(keyHash: Int, rowHash: Long): Unit = {
+    var il = ids.get(keyHash)
+    if (il == null) {
+      il = new it.unimi.dsi.fastutil.ints.IntArrayList()
+      ids.put(keyHash, il)
+      rows.put(keyHash, new it.unimi.dsi.fastutil.longs.LongArrayList())
+    }
+    il.add(state.currentInputId)
+    rows.get(keyHash).add(rowHash)
+  }
 }
 
 /**
@@ -239,6 +316,29 @@ class PostKeyedTapRuntime(tapId: Int) {
   }
 }
 
+/**
+ * Post tap above a shuffle join. Records each output row's join key hash and the row
+ * hashes of its left and right input rows, and threads the output index downstream.
+ */
+class PostShuffleJoinTapRuntime(tapId: Int) {
+  private val ctx = TaskContext.get()
+  private val state = LineageTaskState.get(ctx)
+  private val split = ctx.partitionId()
+  private val keys = new it.unimi.dsi.fastutil.ints.IntArrayList()
+  private val left = new it.unimi.dsi.fastutil.longs.LongArrayList()
+  private val right = new it.unimi.dsi.fastutil.longs.LongArrayList()
+
+  ctx.addTaskCompletionListener[Unit] { _ =>
+    TapBlock.store(tapId, split,
+      ShuffleJoinBlock(split, keys.toIntArray, left.toLongArray, right.toLongArray))
+  }
+
+  def tap(keyHash: Int, leftHash: Long, rightHash: Long): Unit = {
+    state.currentInputId = keys.size()
+    keys.add(keyHash); left.add(leftHash); right.add(rightHash)
+  }
+}
+
 /** Builds a compact (or, under ablation, boxed) keyed block from per-row int values. */
 private object keyedBlockOf {
   def apply(split: Int, values: Array[Int]): TapBlock =
@@ -277,6 +377,8 @@ class PostJoinTapRuntime(tapId: Int, pairId: Int) {
     if (boxedBuffer) null else new it.unimi.dsi.fastutil.longs.LongArrayList()
   private val boxed =
     if (boxedBuffer) new scala.collection.mutable.ArrayBuffer[Any]() else null
+  // Build-row hashes, filled only through the two-argument tap.
+  private val buildRows = new it.unimi.dsi.fastutil.longs.LongArrayList()
 
   ctx.addTaskCompletionListener[Unit] { _ =>
     val longs =
@@ -292,8 +394,15 @@ class PostJoinTapRuntime(tapId: Int, pairId: Int) {
           (PackIntIntoLong(split, i),
             (PackIntIntoLong.getLeft(p), PackIntIntoLong.getRight(p))): Any
         })
-      } else JoinBlock(split, longs)
+      } else JoinBlock(split, longs,
+        if (buildRows.isEmpty && longs.nonEmpty) null else buildRows.toLongArray)
     TapBlock.store(tapId, split, block)
+  }
+
+  /** Like `tap(keyHash)`, also recording the row hash of the matched build row. */
+  def tap(keyHash: Int, buildHash: Long): Unit = {
+    buildRows.add(buildHash)
+    tap(keyHash)
   }
 
   def tap(keyHash: Int): Unit = {

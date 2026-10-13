@@ -168,12 +168,11 @@ class SQLLineageOpsSuite extends AnyFunSuite with BeforeAndAfterEach with Matche
     val suspect = output.maxBy(_._1.getInt(1))
     suspect._1 should equal (Row("o8", 99999, "Bob"))
 
-    // Branch 0 is the orders side and yields all c2 order rows, at key-hash granularity.
+    // Branch 0 is the orders side. It yields only the order row this output joined, not
+    // every c2 order that shares its key.
     val ordersSide = PrismSQL.trace(df, Seq(suspect._2)).goBack(0)
     ordersSide.atScan should be (true)
-    ordersSide.show().toSet should equal (Set(
-      Row("o2", "c2", 250), Row("o5", "c2", 190),
-      Row("o8", "c2", 99999), Row("o11", "c2", 205)))
+    ordersSide.show().toSet should equal (Set(Row("o8", "c2", 99999)))
 
     // Branch 1 is the customers side.
     val customersSide = PrismSQL.trace(df, Seq(suspect._2)).goBack(1)
@@ -218,6 +217,55 @@ class SQLLineageOpsSuite extends AnyFunSuite with BeforeAndAfterEach with Matche
     // Forward from the orders rows through the join level to the aggregate level.
     val up = ordersSide.goNext().goNext()
     up.ids.toSet should equal (PrismSQL.trace(df, Seq(bobId)).ids.toSet)
+  }
+
+  private def joinChainExact(s: SparkSession): Unit = {
+    orders(s).createOrReplaceTempView("orders")
+    customers(s).createOrReplaceTempView("customers")
+    // The group key (amount > 300) is not a join key, so key-level join lineage would
+    // return every order of every customer in the group, all 12 orders.
+    val df = s.sql(
+      """SELECT o.amount > 300 AS big, SUM(o.amount) AS total
+        |FROM orders o JOIN customers c ON o.cid = c.cid
+        |JOIN customers d ON c.name = d.name
+        |GROUP BY o.amount > 300""".stripMargin)
+    val output = PrismSQL.collectWithLineage(df)
+    val bigId = output.find(_._1.getBoolean(0)).get._2
+    val expected = Set(Row("c1", 420), Row("c1", 310), Row("c2", 99999), Row("c3", 380))
+
+    val outer = PrismSQL.trace(df, Seq(bigId)).goBack() // the second join's level
+    val inner = outer.goBack(0)                          // the first join's level
+    val ordersSide = inner.goBack(0)
+    ordersSide.atScan should be (true)
+    ordersSide.show().toSet should equal (expected)
+    inner.goBack(1).show().toSet should equal (
+      Set(Row("c1", "Alice"), Row("c2", "Bob"), Row("c3", "Carol")))
+
+    // Forward from the order rows back to the aggregate level.
+    ordersSide.goNext().goNext().goNext().ids.toSet should equal (
+      PrismSQL.trace(df, Seq(bigId)).ids.toSet)
+
+    // The bounded driver walk and the distributed walk return the same rows.
+    for (threshold <- Seq(500000, 1)) {
+      val dir = java.nio.file.Files.createTempDirectory("prism-chain").toFile
+      dir.delete()
+      val n = PrismSQL.trace(df, Seq(bigId)).writeWitnessesAuto(dir.getPath, threshold)
+      n should be (4L)
+      val lines = s.read.text(dir.getPath).collect().map(_.getString(0)).toSet
+      lines should equal (Set("c1|420", "c1|310", "c2|99999", "c3|380"))
+    }
+  }
+
+  test("join chain traces exact matched rows, not key-level (AQE on)") {
+    joinChainExact(newSession(adaptive = true))
+  }
+
+  test("join chain traces exact matched rows, not key-level (AQE off)") {
+    joinChainExact(newSession(adaptive = false))
+  }
+
+  test("join chain traces exact matched rows, not key-level (codegen off)") {
+    joinChainExact(newSession(adaptive = true, codegen = false))
   }
 
   test("non-equi joins (BroadcastNestedLoopJoin) fail loudly") {
